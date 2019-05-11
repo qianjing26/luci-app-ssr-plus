@@ -9,6 +9,7 @@
 
 TAG="_SS_SPEC_RULE_"   # comment tag
 IPT="iptables -t nat"  # alias of iptables
+IPT6="ip6tables -t nat"
 FWI=$(uci get firewall.shadowsocksr.path 2>/dev/null)  # firewall include file
 
 usage() {
@@ -56,13 +57,23 @@ flush_r() {
 			$ipt -F ${chain:1} 2>/dev/null && $ipt -X ${chain:1}
 		done
 	}
+	flush_iptables6() {
+		local ipt="ip6tables -t $1"
+		local DAT=$(ip6tables-save -t $1)
+		eval $(echo "$DAT" | grep "$TAG" | sed -e 's/^-A/$ipt -D/' -e 's/$/;/')
+		for chain in $(echo "$DAT" | awk '/^:SS_SPEC/{print $1}'); do
+			$ipt -F ${chain:1} 2>/dev/null && $ipt -X ${chain:1}
+		done
+	}
 	flush_iptables nat
 	flush_iptables mangle
+	flush_iptables6 nat
 	ip rule del fwmark 0x01/0x01 table 100 2>/dev/null
 	ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
 	ipset -X ss_spec_lan_ac 2>/dev/null
 	ipset -X ss_spec_wan_ac 2>/dev/null
 	ipset -X ssr_gen_router 2>/dev/null
+	ipset -X ss_spec_wan_ac6 2>/dev/null
 	ipset -X fplan 2>/dev/null
 	ipset -X gmlan 2>/dev/null
 	ipset -X oversea 2>/dev/null
@@ -76,12 +87,18 @@ ipset_r() {
 		create ss_spec_wan_ac hash:net
 		$(gen_iplist | sed -e "s/^/add ss_spec_wan_ac /")
 		$(for ip in $WAN_FW_IP; do echo "add ss_spec_wan_ac $ip nomatch"; done)
+		create ss_spec_wan_ac6 hash:net family inet6
+		$(gen_iplist6 | sed -e "s/^/add ss_spec_wan_ac6 /")
 EOF
 	ipset -N gfwlist hash:net 2>/dev/null
 	$IPT -N SS_SPEC_WAN_AC 
 	$IPT -I SS_SPEC_WAN_AC -d $server -j RETURN
 	$IPT -A SS_SPEC_WAN_AC -m set --match-set ss_spec_wan_ac dst -j RETURN
 	$IPT -A SS_SPEC_WAN_AC -j SS_SPEC_WAN_FW
+	
+	$IPT6 -N SS_SPEC_WAN_AC
+	$IPT6 -A SS_SPEC_WAN_AC -m set --match-set ss_spec_wan_ac6 dst -j RETURN
+	$IPT6 -A SS_SPEC_WAN_AC -j SS_SPEC_WAN_FW
 	
 	elif [ "$RUNMODE" = "gfw" ] ;then
 	ipset -N gfwlist hash:net 2>/dev/null
@@ -105,7 +122,7 @@ EOF
 	$IPT -N SS_SPEC_WAN_AC
 	$IPT -A SS_SPEC_WAN_AC -j SS_SPEC_WAN_FW
 	$IPT -I SS_SPEC_WAN_AC -d $server -j RETURN
-	
+
 	fi
 	
 	ipset -N fplan hash:net 2>/dev/null
@@ -128,6 +145,14 @@ fw_rule() {
 	$IPT -A SS_SPEC_WAN_FW -p tcp \
 		-j REDIRECT --to-ports $local_port 2>/dev/null || {
 		loger 3 "Can't redirect, please check the iptables."
+		exit 1
+	}
+	$IPT6 -N SS_SPEC_WAN_FW
+	$IPT6 -A SS_SPEC_WAN_FW -d fc00::/7 -j RETURN
+	$IPT6 -A SS_SPEC_WAN_FW -d ff00::/8 -j RETURN
+	$IPT6 -A SS_SPEC_WAN_FW -p tcp \
+		-j REDIRECT --to-ports $local_port 2>/dev/null || {
+		loger 3 "Can't redirect, please check the ip6tables."
 		exit 1
 	}
 	return $?
@@ -154,6 +179,8 @@ ac_rule() {
 		$(for ip in ${LAN_AC_IP:1}; do echo "add ss_spec_lan_ac $ip"; done)
 EOF
 	$IPT -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p tcp $EXT_ARGS $MATCH_SET \
+		-m comment --comment "$TAG" -j SS_SPEC_WAN_AC
+	$IPT6 -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p tcp $EXT_ARGS $MATCH_SET \
 		-m comment --comment "$TAG" -j SS_SPEC_WAN_AC
 	if [ "$OUTPUT" = 1 ]; then
 		$IPT -I OUTPUT 1 -p tcp $EXT_ARGS \
@@ -246,6 +273,14 @@ gen_iplist() {
 EOF
 }
 
+gen_iplist6() {
+	cat <<-EOF
+		fc00::/7
+		ff00::/8
+		$(cat ${IGNORE_LIST6:=/dev/null} 2>/dev/null)
+EOF
+}
+
 gen_spec_iplist() {
 	cat <<-EOF
 		0.0.0.0/8
@@ -286,7 +321,24 @@ EOF
 	return 0
 }
 
-while getopts ":s:l:S:L:i:e:a:b:w:p:G:oOuUfgrczh" arg; do
+gen_include6() {
+	[ -n "$FWI" ] || return 0
+	extract_rules() {
+		echo "*$1"
+		ip6tables-save -t $1 | grep SS_SPEC_ |\
+			sed -e "s/^-A \(OUTPUT\|PREROUTING\)/-I \1 1/"
+		echo 'COMMIT'
+	}
+	cat <<-EOF >>$FWI
+	ip6tables-save -c | grep -v "SS_SPEC" | ip6tables-restore -c
+	ip6tables-restore -n <<-EOT
+	$(extract_rules nat)
+	EOT
+EOF
+	return 0
+}
+
+while getopts ":s:l:S:L:i:I:e:a:b:w:p:G:oOuUfgrczh" arg; do
 	case "$arg" in
 		s)
 			server=$OPTARG
@@ -302,6 +354,9 @@ while getopts ":s:l:S:L:i:e:a:b:w:p:G:oOuUfgrczh" arg; do
 			;;
 		i)
 			IGNORE_LIST=$OPTARG
+			;;
+		I)
+			IGNORE_LIST6=$OPTARG
 			;;
 		e)
 			EXT_ARGS=$OPTARG
@@ -341,10 +396,10 @@ while getopts ":s:l:S:L:i:e:a:b:w:p:G:oOuUfgrczh" arg; do
 			;;	
 		c)
 			RUNMODE=oversea
-			;;
+			;;			
 		z)
 			RUNMODE=all
-			;;		
+			;;
 		f)
 			flush_r
 			exit 0
@@ -367,6 +422,18 @@ elif [ "$TPROXY" = 2 ]; then
 	: ${LOCAL_PORT:?"You must assign a port for the udp relay server."}
 fi
 
-flush_r && fw_rule && ipset_r && ac_rule && tp_rule && gen_include
-[ "$?" = 0 ] || loger 3 "Start failed!"
+flush_r
+[ "$?" = 0 ] || loger 3 "Start failed1!"
+fw_rule
+[ "$?" = 0 ] || loger 3 "Start failed2!"
+ipset_r
+[ "$?" = 0 ] || loger 3 "Start failed3!"
+ac_rule
+[ "$?" = 0 ] || loger 3 "Start failed4!"
+tp_rule
+[ "$?" = 0 ] || loger 3 "Start failed5!"
+gen_include
+[ "$?" = 0 ] || loger 3 "Start failed6!"
+gen_include6
+[ "$?" = 0 ] || loger 3 "Start failed7!"
 exit $?
